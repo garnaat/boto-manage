@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+# Copyright (c) 2009 Mitch Garnaat http://garnaat.org/
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish, dis-
+# tribute, sublicense, and/or sell copies of the Software, and to permit
+# persons to whom the Software is furnished to do so, subject to the fol-
+# lowing conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABIL-
+# ITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+# SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, 
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+from optparse import OptionParser
+import boto
+import sys, os, StringIO
+from boto.exception import SDBPersistenceError
+
+class BMG(object):
+
+    Usage = "usage: %prog [options] command"
+
+    Commands = {'ls' : 'List Servers (i.e. current EC2 instances)',
+                'lv' : 'List Volumes (i.e. current EBS Volumes)',
+                'tv' : 'Trim Volumes (trim snapshots)',
+                'rs' : 'Register Servers - find unregistered instances',
+                'rv' : 'Register Volumes - find unregistered volumes',
+                'cs' : 'Create Server'}
+    
+    def __init__(self):
+        self.service_name = None
+        self.parser = OptionParser(usage=self.Usage)
+        self.parser.add_option("--help-commands", action="store_true", dest="help_commands",
+                               help="provides help on the available commands")
+        self.parser.add_option("-a", "--access-key", action="store", type="string",
+                               dest='aws_access_key_id', help="your AWS Access Key")
+        self.parser.add_option("-s", "--secret-key", action="store", type="string",
+                               dest='aws_secret_access_key', help="your AWS Secret Access Key")
+        self.parser.add_option("-d", "--domain", action="store", type="string", dest="domain_name",
+                               help="the SimpleDB domain used for storing metadata",
+                               default='boto-manage')
+        self.parser.add_option("-k", "--keypair", action="store", type="string", dest="keypair",
+                               help="the SSH keypair used with launched instance(s)")
+        self.parser.add_option('-n', '--name', action='store',
+                               type='string', dest='name',
+                               help='The name of a specific object to act upon')
+        self.ec2 = None
+        self.sdb = None
+        self.domain = None
+
+    def get_ec2(self):
+        if not self.ec2:
+            self.ec2 = boto.connect_ec2(self.options.aws_access_key_id,
+                                        self.options.aws_secret_access_key)
+        return self.ec2
+    
+    def get_domain(self):
+        if not self.domain:
+            self.sdb = boto.connect_sdb(self.options.aws_access_key_id,
+                                        self.options.aws_secret_access_key)
+            self.domain = self.sdb.lookup(self.options.domain_name)
+        return self.domain
+    
+    def print_command_help(self):
+        print '\nCommands:'
+        for key in self.Commands.keys():
+            print '  %s\t\t%s' % (key, self.Commands[key])
+
+    def do_ls(self):
+        domain = self.get_domain()
+        query = "select * from `%s` where `_type`='instance'" % domain.name
+        if self.options.name:
+            query += " and `name`='%s'" % self.options.name
+        rs = domain.select(query)
+        print '\tName\tDescription\tID\tTags'
+        for item in rs:
+            print '\t%s\t%s\t%s\t%s' % (item['name'], item['description'],
+                                        item.name, item['tags'])
+
+    def do_lv(self):
+        from boto.manage.volume import Volume
+        print '\tName\tID\tSize'
+        for volume in Volume.all():
+            print '\t%s\t%s\t%d' % (volume.name, volume.volume_id, volume.size)
+
+    def do_rs(self):
+        ec2 = self.get_ec2()
+        domain = self.get_domain()
+        n = 0
+        for r in ec2.get_all_instances():
+            for i in r.instances:
+                if i.state != 'terminated':
+                    item = domain.get_attributes(i.id)
+                    if not item:
+                        print "Instance: %s Has not been registered " % i.id
+                        print "\tLaunched: %s" % i.launch_time
+                        print "\tState: %s" % i.state
+                        print "\tHostname: %s" % i.public_dns_name
+                        groups = [g.id for g in r.groups]
+                        print "\tGroups: %s" % groups
+                        print "\tInstance_type: %s" % i.instance_type
+                        img = ec2.get_all_images([i.image_id])[0]
+                        print "\tAMI ID: %s" % i.image_id
+                        print '\tAMI Type: %s' % img.type
+                        print "\tAMI Info: %s" % (img.name or img.location)
+                        print "Please enter information for this server"
+                        item['name'] = raw_input("Name: ")
+                        item['description'] = raw_input("Description: ")
+                        tags = raw_input("Tags: ")
+                        item['tags'] = tags.split(',')
+                        item['_type'] = 'instance'
+                        item.save()
+                        n += 1
+        if n == 0:
+            print 'All EC2 instances are already registered'
+        else:
+            print 'A total of %d unregistered EC2 instances were processed' % n
+
+    def do_rv(self):
+        from boto.manage.volume import Volume
+        ec2 = boto.connect_ec2()
+        n = 0
+        for v in ec2.get_all_volumes():
+            try:
+                vol = Volume.find(volume_id=v.id).next()
+            except StopIteration:
+                vol = None
+                while not vol:
+                    print "Volume: [%s] %dGB Has no Volume object!" % (v.id, v.size)
+                    print "Please enter information for this volume"
+                    name = raw_input("Name: ")
+                    try:
+                        vol = Volume.create_from_volume_id(ec2.region.name, v.id, name=name)
+                    except SDBPersistenceError:
+                        print '! That name is already in use, please choose another'
+                n += 1
+        if n == 0:
+            print 'All EBS Volumes are already registered'
+        else:
+            print 'A total of %d unregistered EBS volumes were processed' % n
+
+    def do_tv(self):
+        from boto.manage.volume import Volume
+        ec2 = boto.connect_ec2()
+        for v in Volume.all():
+            print 'Trimming snaps on %s' % v.name
+            v.trim_snapshots(True)
+        print 'Snapshots trimmed on all volumes'
+
+    def do_cs(self):
+        from boto.manage.server import Server
+        s = Server.create()
+
+    def main(self):
+        self.options, self.args = self.parser.parse_args()
+        if self.options.help_commands:
+            self.print_command_help()
+            sys.exit(0)
+        if len(self.args) != 1:
+            self.parser.error("command is required")
+        if self.options.aws_access_key_id:
+            boto.config.set('Credentials', 'aws_access_key_id',
+                            self.options.aws_access_key_id)
+        if self.options.aws_secret_access_key:
+            boto.config.set('Credentials', 'aws_secret_access_key',
+                            self.options.aws_secret_access_key)
+        self.command = self.args[0]
+        if hasattr(self, 'do_%s' % self.command):
+            method = getattr(self, 'do_%s' % self.command)
+            method()
+        else:
+            self.parser.error('command (%s) not recognized' % self.command)
+
+if __name__ == "__main__":
+    bmg = BMG()
+    bmg.main()
