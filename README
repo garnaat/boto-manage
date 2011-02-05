@@ -1,0 +1,8 @@
+This code is focused on building a git-style command line tool that
+leverages the boto.manage package for registering and managing EC2
+resources.  The boto.manage package predates the EC2 tagging features
+and stores metadata about instances and volumes in SimpleDB.
+
+This project is not complete.  The existing "bmg" command works but
+only provides a handful of commands.  Still, it might be useful to
+someone.
